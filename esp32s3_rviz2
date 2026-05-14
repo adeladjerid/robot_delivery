@@ -1,0 +1,173 @@
+#include <Arduino.h>
+
+// ── Pin assignments ───────────────────────────────────────────────────
+#define L_IN1  15
+#define L_IN2  16
+#define L_EN   17
+
+#define R_IN1  18
+#define R_IN2  8
+#define R_EN   3
+
+// ── Encoder pins ──────────────────────────────────────────────────────
+#define ENC_L_A  1
+#define ENC_L_B  2
+#define ENC_R_A  42
+#define ENC_R_B  41
+
+// ── LEDC PWM ──────────────────────────────────────────────────────────
+#define PWM_FREQ   20000
+#define PWM_RES    8
+
+// ── Motor tuning ─────────────────────────────────────────────────────
+const int   MIN_PWM = 90;
+const int   MAX_PWM = 220;
+const float MAX_VEL = 8.0f;
+
+// ── Encoder config ───────────────────────────────────────────────────
+const int   PPR           = 234;                       // pulses per wheel revolution
+const float RAD_PER_COUNT = (2.0f * PI) / (float)PPR;
+
+// ── Direction signs — flip to -1 if a wheel goes backward in RViz ───
+const int L_ENC_DIR =  -1;
+const int R_ENC_DIR =  1;
+
+// ── Encoder counters (updated by ISR) ────────────────────────────────
+volatile int32_t enc_l = 0;
+volatile int32_t enc_r = 0;
+
+// ── Odometry state ────────────────────────────────────────────────────
+int32_t       last_enc_l    = 0;
+int32_t       last_enc_r    = 0;
+unsigned long last_odom_ms  = 0;
+const unsigned long ODOM_PERIOD_MS = 33;   // ~30 Hz to match controller
+
+// ── Watchdog ──────────────────────────────────────────────────────────
+const unsigned long CMD_TIMEOUT_MS = 500;
+unsigned long last_cmd_time = 0;
+
+// ── Velocity targets ──────────────────────────────────────────────────
+float target_vel_l = 0.0f;
+float target_vel_r = 0.0f;
+
+// ── Serial buffer ─────────────────────────────────────────────────────
+String serial_buf = "";
+
+// ── Encoder ISRs ─────────────────────────────────────────────────────
+void IRAM_ATTR isr_enc_l() {
+  // Rising edge on A: if B is HIGH → forward (+), else backward (-)
+  if (digitalRead(ENC_L_B) == HIGH) enc_l += L_ENC_DIR;
+  else                               enc_l -= L_ENC_DIR;
+}
+
+void IRAM_ATTR isr_enc_r() {
+  if (digitalRead(ENC_R_B) == HIGH) enc_r += R_ENC_DIR;
+  else                               enc_r -= R_ENC_DIR;
+}
+
+// ── Motor helpers ─────────────────────────────────────────────────────
+void stopMotor(int in1, int in2, int en_pin) {
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  ledcWrite(en_pin, 0);
+}
+
+void driveMotor(int in1, int in2, int en_pin, float vel) {
+  if (abs(vel) < 0.05f) { stopMotor(in1, in2, en_pin); return; }
+  float ratio = constrain(abs(vel) / MAX_VEL, 0.0f, 1.0f);
+  int pwm = (int)(MIN_PWM + ratio * (MAX_PWM - MIN_PWM));
+  digitalWrite(in1, vel > 0 ? HIGH : LOW);
+  digitalWrite(in2, vel < 0 ? HIGH : LOW);
+  ledcWrite(en_pin, pwm);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(L_IN1, OUTPUT); pinMode(L_IN2, OUTPUT);
+  pinMode(R_IN1, OUTPUT); pinMode(R_IN2, OUTPUT);
+
+  ledcAttach(L_EN, PWM_FREQ, PWM_RES);
+  ledcAttach(R_EN, PWM_FREQ, PWM_RES);
+
+  stopMotor(L_IN1, L_IN2, L_EN);
+  stopMotor(R_IN1, R_IN2, R_EN);
+
+  // Encoder pins — input with pullup
+  pinMode(ENC_L_A, INPUT_PULLUP); pinMode(ENC_L_B, INPUT_PULLUP);
+  pinMode(ENC_R_A, INPUT_PULLUP); pinMode(ENC_R_B, INPUT_PULLUP);
+
+  // Attach interrupts on rising edge of channel A
+  attachInterrupt(digitalPinToInterrupt(ENC_L_A), isr_enc_l, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_A), isr_enc_r, RISING);
+
+  last_cmd_time  = millis();
+  last_odom_ms   = millis();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void loop() {
+
+  // 1. Read serial commands
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      int comma = serial_buf.indexOf(',');
+      if (comma > 0 && comma < (int)serial_buf.length() - 1) {
+        float vl = serial_buf.substring(0, comma).toFloat();
+        float vr = serial_buf.substring(comma + 1).toFloat();
+        if (vl >= -50.0f && vl <= 50.0f && vr >= -50.0f && vr <= 50.0f) {
+          target_vel_l  = vl;
+          target_vel_r  = vr;
+          last_cmd_time = millis();
+        }
+      }
+      serial_buf = "";
+    } else if (c != '\r') {
+      serial_buf += c;
+      if (serial_buf.length() > 32) serial_buf = "";
+    }
+  }
+
+  // 2. Watchdog
+  if (millis() - last_cmd_time > CMD_TIMEOUT_MS) {
+    target_vel_l = 0.0f;
+    target_vel_r = 0.0f;
+    stopMotor(L_IN1, L_IN2, L_EN);
+    stopMotor(R_IN1, R_IN2, R_EN);
+  } else {
+    // 3. Drive motors
+    driveMotor(L_IN1, L_IN2, L_EN,  target_vel_l);
+    driveMotor(R_IN1, R_IN2, R_EN, -target_vel_r);  // hardware direction fix
+  }
+
+  // 4. Send odometry at fixed 30 Hz
+  unsigned long now = millis();
+  if (now - last_odom_ms >= ODOM_PERIOD_MS) {
+    float dt = (now - last_odom_ms) / 1000.0f;
+    last_odom_ms = now;
+
+    // Snapshot encoder counts safely (disable ISR briefly)
+    noInterrupts();
+    int32_t cur_l = enc_l;
+    int32_t cur_r = enc_r;
+    interrupts();
+
+    int32_t diff_l = cur_l - last_enc_l;
+    int32_t diff_r = cur_r - last_enc_r;
+    last_enc_l = cur_l;
+    last_enc_r = cur_r;
+
+    float delta_l = diff_l * RAD_PER_COUNT;   // radians
+    float delta_r = diff_r * RAD_PER_COUNT;
+
+    float vel_l = delta_l / dt;               // rad/s
+    float vel_r = delta_r / dt;
+
+    Serial.print(delta_l, 5); Serial.print(",");
+    Serial.print(delta_r, 5); Serial.print(",");
+    Serial.print(vel_l,   5); Serial.print(",");
+    Serial.println(vel_r, 5);
+  }
+}
