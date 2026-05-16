@@ -62,7 +62,7 @@ const int PWM_MAX = 255;
 // PID
 // ═══════════════════════════════════════════════════════════════════════
 const float KP = 2.0f;
-const float KI = 2.7f;
+const float KI = 6.0f;
 const float KD = 0.1f;
 
 struct PID {
