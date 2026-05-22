@@ -1,0 +1,241 @@
+#include <Arduino.h>
+
+// ── Pin assignments ───────────────────────────────────────────────────
+#define L_IN1  15
+#define L_IN2  16
+#define L_EN   17
+#define R_IN1  18
+#define R_IN2  8
+#define R_EN   3
+
+// ── Encoder pins ──────────────────────────────────────────────────────
+#define ENC_L_A  1
+#define ENC_L_B  2
+#define ENC_R_A  42
+#define ENC_R_B  41
+
+// ── LEDC PWM ──────────────────────────────────────────────────────────
+#define PWM_FREQ  20000
+#define PWM_RES   8
+
+// ── Encoder config ────────────────────────────────────────────────────
+const int   PPR           = 234;
+const float RAD_PER_COUNT = (2.0f * PI) / (float)PPR;
+
+// ── Encoder direction signs ───────────────────────────────────────────
+const int L_ENC_DIR = -1;
+const int R_ENC_DIR =  1;
+
+// ── Encoder counters ──────────────────────────────────────────────────
+volatile int32_t enc_l = 0;
+volatile int32_t enc_r = 0;
+
+// ── Odometry state ────────────────────────────────────────────────────
+int32_t       last_enc_l   = 0;
+int32_t       last_enc_r   = 0;
+unsigned long last_odom_ms = 0;
+const unsigned long ODOM_PERIOD_MS = 10;  // 100 Hz
+
+// ── Velocity filter state ─────────────────────────────────────────────
+float vel_l_filtered = 0.0f;
+float vel_r_filtered = 0.0f;
+const float VEL_FILTER = 0.7f;
+
+// ── Watchdog ──────────────────────────────────────────────────────────
+const unsigned long CMD_TIMEOUT_MS = 500;
+unsigned long last_cmd_time = 0;
+
+// ── Velocity targets ──────────────────────────────────────────────────
+float target_vel_l = 0.0f;
+float target_vel_r = 0.0f;
+
+// ── Serial buffer ─────────────────────────────────────────────────────
+String serial_buf = "";
+
+// ═══════════════════════════════════════════════════════════════════════
+// PWM limits  ← test with weight, increase if motor stalls
+// ═══════════════════════════════════════════════════════════════════════
+const int PWM_MIN = 145;  // start here with weight, increase if needed
+const int PWM_MAX = 255;
+
+// ═══════════════════════════════════════════════════════════════════════
+// PID
+// ═══════════════════════════════════════════════════════════════════════
+const float KP = 2.0f;
+const float KI = 2.5f;
+const float KD = 0.0f;
+
+struct PID {
+  float kp, ki, kd;
+  float integral   = 0.0f;
+  float prev_error = 0.0f;
+  const float INTEGRAL_MAX = 50.0f;  // reduced to prevent windup
+
+  float compute(float target, float actual, float dt) {
+    if (dt <= 0.0f) return 0.0f;
+    float error      = target - actual;
+    integral        += error * dt;
+    integral         = constrain(integral, -INTEGRAL_MAX, INTEGRAL_MAX);
+    float derivative = (error - prev_error) / dt;
+    prev_error       = error;
+    return kp * error + ki * integral + kd * derivative;
+  }
+
+  void reset() {
+    integral   = 0.0f;
+    prev_error = 0.0f;
+  }
+};
+
+PID pid_l = {KP, KI, KD};
+PID pid_r = {KP, KI, KD};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Motor helpers
+// ═══════════════════════════════════════════════════════════════════════
+void stopMotor(int in1, int in2, int en_pin) {
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  ledcWrite(en_pin, 0);
+}
+
+void driveMotorPID(int in1, int in2, int en_pin, float pid_output, float target_vel) {
+  if (abs(target_vel) < 0.05f) {
+    stopMotor(in1, in2, en_pin);
+    return;
+  }
+
+  // Feedforward + PID correction on top
+  int pwm = PWM_MIN + (int)abs(pid_output);
+  pwm = constrain(pwm, PWM_MIN, PWM_MAX);
+
+  digitalWrite(in1, target_vel > 0 ? HIGH : LOW);
+  digitalWrite(in2, target_vel < 0 ? HIGH : LOW);
+  ledcWrite(en_pin, pwm);
+}
+
+// ── Encoder ISRs ──────────────────────────────────────────────────────
+void IRAM_ATTR isr_enc_l() {
+  if (digitalRead(ENC_L_B) == HIGH) enc_l += L_ENC_DIR;
+  else                               enc_l -= L_ENC_DIR;
+}
+
+void IRAM_ATTR isr_enc_r() {
+  if (digitalRead(ENC_R_B) == HIGH) enc_r += R_ENC_DIR;
+  else                               enc_r -= R_ENC_DIR;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(L_IN1, OUTPUT); pinMode(L_IN2, OUTPUT);
+  pinMode(R_IN1, OUTPUT); pinMode(R_IN2, OUTPUT);
+
+  ledcAttach(L_EN, PWM_FREQ, PWM_RES);
+  ledcAttach(R_EN, PWM_FREQ, PWM_RES);
+
+  stopMotor(L_IN1, L_IN2, L_EN);
+  stopMotor(R_IN1, R_IN2, R_EN);
+
+  pinMode(ENC_L_A, INPUT_PULLUP); pinMode(ENC_L_B, INPUT_PULLUP);
+  pinMode(ENC_R_A, INPUT_PULLUP); pinMode(ENC_R_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENC_L_A), isr_enc_l, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_A), isr_enc_r, RISING);
+
+  last_cmd_time = millis();
+  last_odom_ms  = millis();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+void loop() {
+
+  // 1. Read serial commands
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      int comma = serial_buf.indexOf(',');
+      if (comma > 0 && comma < (int)serial_buf.length() - 1) {
+        float vl = serial_buf.substring(0, comma).toFloat();
+        float vr = serial_buf.substring(comma + 1).toFloat();
+        if (vl >= -50.0f && vl <= 50.0f && vr >= -50.0f && vr <= 50.0f) {
+          target_vel_l  = vl;
+          target_vel_r  = vr;
+          last_cmd_time = millis();
+        }
+      }
+      serial_buf = "";
+    } else if (c != '\r') {
+      serial_buf += c;
+      if (serial_buf.length() > 32) serial_buf = "";
+    }
+  }
+
+  // 2. Watchdog
+  if (millis() - last_cmd_time > CMD_TIMEOUT_MS) {
+    target_vel_l   = 0.0f;
+    target_vel_r   = 0.0f;
+    vel_l_filtered = 0.0f;
+    vel_r_filtered = 0.0f;
+    pid_l.reset();
+    pid_r.reset();
+    stopMotor(L_IN1, L_IN2, L_EN);
+    stopMotor(R_IN1, R_IN2, R_EN);
+    return;
+  }
+
+  // 3. Odometry + PID at 100 Hz
+  unsigned long now = millis();
+  if (now - last_odom_ms >= ODOM_PERIOD_MS) {
+    float dt = (now - last_odom_ms) / 1000.0f;
+    last_odom_ms = now;
+
+    noInterrupts();
+    int32_t cur_l = enc_l;
+    int32_t cur_r = enc_r;
+    interrupts();
+
+    int32_t diff_l = cur_l - last_enc_l;
+    int32_t diff_r = cur_r - last_enc_r;
+    last_enc_l = cur_l;
+    last_enc_r = cur_r;
+
+    float delta_l   = diff_l * RAD_PER_COUNT;
+    float delta_r   = diff_r * RAD_PER_COUNT;
+
+    // Raw velocity
+    float vel_l_raw = delta_l / dt;
+    float vel_r_raw = delta_r / dt;
+
+    // Low pass filter
+    vel_l_filtered = VEL_FILTER * vel_l_filtered + (1.0f - VEL_FILTER) * vel_l_raw;
+    vel_r_filtered = VEL_FILTER * vel_r_filtered + (1.0f - VEL_FILTER) * vel_r_raw;
+
+    // Left motor
+    if (abs(target_vel_l) < 0.05f) {
+      stopMotor(L_IN1, L_IN2, L_EN);
+      pid_l.reset();
+      vel_l_filtered = 0.0f;
+    } else {
+      float out_l = pid_l.compute(target_vel_l, vel_l_filtered, dt);
+      driveMotorPID(L_IN1, L_IN2, L_EN, out_l, target_vel_l);
+    }
+
+    // Right motor
+    if (abs(target_vel_r) < 0.05f) {
+      stopMotor(R_IN1, R_IN2, R_EN);
+      pid_r.reset();
+      vel_r_filtered = 0.0f;
+    } else {
+      float out_r = pid_r.compute(target_vel_r, vel_r_filtered, dt);
+      driveMotorPID(R_IN1, R_IN2, R_EN, -out_r, -target_vel_r);
+    }
+
+    // ── Send odometry — raw delta, FILTERED velocity to ROS ──
+    Serial.print(delta_l, 5);        Serial.print(",");
+    Serial.print(delta_r, 5);        Serial.print(",");
+    Serial.print(vel_l_filtered, 5); Serial.print(",");
+    Serial.println(vel_r_filtered, 5);
+  }
+}
