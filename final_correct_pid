@@ -160,8 +160,8 @@ void loop() {
         float vl = serial_buf.substring(0, comma).toFloat();
         float vr = serial_buf.substring(comma + 1).toFloat();
         if (vl >= -50.0f && vl <= 50.0f && vr >= -50.0f && vr <= 50.0f) {
-          target_vel_l  = vl;
-          target_vel_r  = vr;
+          target_vel_l  = -vl;
+          target_vel_r  = -vr;
           last_cmd_time = millis();
         }
       }
